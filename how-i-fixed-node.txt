@@ -1,0 +1,99 @@
+How I fixed Node.js -- my first open-source contribution
+
+It was the lazy Saturday after Thanksgiving, and to burn off some of the extra calories from the preceding days I decided to break into the open-source world. I'd worked with node.js at Jut for the past year and a half, so I was acquainted with the platform, though I had no experience with the source code. So I wandered into the issue tracker for the node.js repository, settling on https://github.com/nodejs/node/issues/4049, a memory leak in the Child Process module. The Child Process module is a part of node.js that runs shell commands. You can run a shell command from a node process using ChildProcess.spawn(). The object returned from ChildProcess.spawn() has fields called stdout and stderr. The value of stdout is a stream from which you can read any data that the executed process calculates, and stderr is a stream from which you can read information about any errors that occur during the executed process. The filer of the issue had found a combination of spawning processes, reading from their stdout streams, and killing the processes that caused a memory leak. A lot of my work at Jut involved running down memory leaks, so I figured I was qualified to attack this one. 
+
+The issue handily came with reproducing code. Here it is (I added some comments and changed some variable names from the original, for clarity):
+
+var ChildProcess = require('child_process'); // node.js core library for running operating system processes ("ls", "rm" etc.)
+var weak = require('weak'); // nifty NPM library that lets you fire a callback when an object is freed
+
+var child_processes_in_memory = 0;
+
+function callback() {
+  console.log(child_processes_in_memory--); // one fewer process is in memory now that this one has been freed
+}
+
+setInterval(function spawnKill() {
+  var p = ChildProcess.spawn('yes'); // start a process running the "yes" command
+
+  ++child_processes_in_memory; // p is now in memory, so increment child_processes_in_memory
+
+  p.stdout.read(); // get some data from the process (since p is running "yes" the data looks like newline separated 'y' characters)
+  p.kill(); // stop the process, this should free up all the resources associated with it enabling p to be freed
+
+  weak(p, callback); // call callback() when p is freed
+
+  gc(); // trigger an immediate garbage collection, so p will be deallocated right here if possible
+
+}, 50);
+
+The first step was to witness the failure on my own machine. I downloaded the node source code, ran the script and lo: a memory leak. Now it was time to dive into the code. I had three functions that I needed to understand before I could fix this leak: spawn, read, and kill. I decided to start with kill, because I had a hunch that was where the problem was. I tracked down ChildProcess's kill function, but it just delegated to this._handle.kill(). To figure out what that meant, I had to go back to the ChildProcess constructor, where I saw the initializer this._handle = new Process();. Process is defined by the v8 library that underlies Node. v8 is much more mature than Node, so I decided to operate for the moment under the assumption that Process was working okay, and the problem was in Node, not v8, so I didn't inspect Process's source code in any depth. 
+
+But two lines after the initialization of this._handle, I noticed the line this._handle.onexit = function(exitCode, signalCode) { ... Based on the name, I figured this would be where ChildProcess was supposed to clean up its resources after its process had been killed. The interesting part for me was this bit at the end of the function:
+
+    // if any of the stdio streams have not been touched,
+    // then pull all the data through so that it can get the
+    // eof and emit a 'close' event.
+    // Do it on nextTick so that the user has one last chance
+    // to consume the output, if for example they only want to
+    // start reading the data once the process exits.
+    process.nextTick(flushStdio, self);
+
+    maybeClose(self);
+
+The function name maybeClose suggested that that function didn't always succeed -- a process might not end up closing. To figure out under what circumstances the process wouldn't close, I went to its definition:
+
+function maybeClose(subprocess) {
+  subprocess._closesGot++;
+
+  if (subprocess._closesGot == subprocess._closesNeeded) {
+    subprocess.emit('close', subprocess.exitCode, subprocess.signalCode);
+  }
+}
+
+To interpret this, I had to find out what those _closesGot and _closesNeeded fields meant. I found their declarations in the spawn method -- _closesNeeded is set to 1 and incremented for each output stream associated with the process, and _closesGot is initialized to 0 and only incremented here in maybeClose. The spawn method puts an event handler on each stream, calling maybeClose in response to a 'close' event from that stream. Since I had spawned p without any fancy parameters, it had the default stream configuration: two output streams called this.stdout and this.stderr. So it is expecting three _closesGot before it will declare itself closed. These _closesGot come from the maybeClose call in this._handle.onexit plus one from each maybeClose call in response to 'close' events from stdout and stderr. I had a hunch that it wasn't getting all three. To confirm this, I wanted to see what events my process objects were emitting. I implemented this with some tweaks to my test script:
+
+var process_index = 0; // label each process with this counter value so we know who's emitting what events 
+setInterval(function spawnKill() {
+  var p = ChildProcess.spawn('yes'); // start a process running the "yes" command
+  p.number = process_index++;
+  var old_emit = p.emit; // save a reference to p's ordinary function that emits events
+
+  p.emit = function(type) { // overwrite p's emit function
+    console.log(p.number, type); // log the index of this process and the type of the emitted event
+    old_emit.apply(p, arguments); // handle the event as we ordinarily would using p's original emit function
+  };
+
+  // ... rest of the script as above
+
+Maybe I'm crazy, but I find hacks like that ridiculously beautiful. The way Javascript lets you freely manipulate your objects is one of the main reasons I love it. Anyway, running the script that way, I got to see every event that my processes were emitting, and sure enough, the ones that were never getting freed were never emitting 'close' events either. By similarly tracing the emits from stderr and stdout, I found that stdout was not always closing. This meant that p was stuck at two close events (the ones from this._handle.exit and stderr), so it never could close itself. 
+
+So somehow my call to p.stdout.read() was preventing p.stdout from closing once I killed the process p. To figure out why, I had to check out the code for read, defined in net.js. It looks like this:
+
+Socket.prototype.read = function(n) {
+  if (n === 0)
+    return stream.Readable.prototype.read.call(this, n);
+
+  this.read = stream.Readable.prototype.read;
+  this._consuming = true;
+  return this.read(n);
+};
+
+It's a little tricky, but basically all it does is delegate to stream.Readable.prototype.read, setting this._consuming to true the first time it is called with a nonzero argument. Since I call p.stdout.read(), n is undefined, not 0. That means this._consuming does get set to true. stream.Readable.prototype.read is a 120-line tangle of a method that required a lot of consideration, but I eventually figured it out. Each stream object has a buffer, which the stream's data source writes into whenever new data is available. When you call read() on a stream, it chops a slice off this buffer and returns it to you. Since my script calls read() immediately after initializing the stream, no data is available yet, so the read() just returns null. So how did this read sometimes prevent us from closing down the stream appropriately at the end of the child process?
+
+The final piece of the puzzle was the flushStdio method of ChildProcess, the other function (besides maybeClose) that ChildProcess calls in this._handle.onexit. Here's how it looked when I found it:
+
+function flushStdio(subprocess) {
+  if (subprocess.stdio == null) return;
+  subprocess.stdio.forEach(function(stream, fd, stdio) {
+    if (!stream || !stream.readable || stream._consuming)
+      return;
+    stream.resume();
+  });
+}
+
+stream.resume() is a method that tells the stream to emit all the data in its buffer, then tear itself down. That seems important. But look! We don't call it if the stream has its _consuming field set. We set this._consuming to true in Socket.prototype.read, so we never called flush() on stdout after reading from it. This seemed likely to be the cause of the memory leak. So I replaced if (!stream || !stream.readable || stream._consuming) with if (!stream || !stream.readable) and reran my leak-generating script. Sure enough, no leak ensued! I had fixed node.js. I'm not sure how the original broken code came into existence in the first place, but there had recently been a major refactor of how Node's streams are implemented, so I guess this slipped through the cracks.
+
+With the mystery solved, all that remained was to get my code into production. I wrote up a little test that spawns and kills a process and wait for the close event from it, made sure it failed on the master branch and passed on my branch, and opened a pull request against node with my change and the test. The reviewers noted that my original test spawned a process using the "yes" command, which apparently doesn't work on Windows. When I changed it to the universal "echo" command, they approved my commit, and just like that I was a node.js contributor! 
+
+So that's the story of how I learned a new codebase, fixed a pretty significant bug in node.js, and made the world a better place. Not too bad for the lazy Saturday after Thanksgiving!

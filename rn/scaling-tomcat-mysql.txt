@@ -1,0 +1,9 @@
+Right now provides its users with constant real-time updates about the users in their area. To support this, the app sends updates every ten seconds to our central server containing the location of the device it is running on. Handling this stream of updates from every instance of right now presents a large technical challenge. Here's how we scaled our platform to take it all in.
+
+In the beginning, we had [HTTPS setup]. But this had terrible performance -- check out this run of Apache benchmarking against that server: [Benchmarking].
+
+But then we fixed our HTTPS [how?]. Then our performance loooked more like [Benchmarking].
+
+I wanted to squeeze a bit more vertical scale out of the platform, so I took a deep dive into our location updating code. It looked like [code]. See how user is a fancy object? We implemented that as a fancy Hibernate join column: [code]. This made for some convenient programming as you see, but it cost us that extra findOne lookup on every insert. Since we needed to support more writes, I decided to take out this overhead. So now we only store the user ID, and any code that needs other information from the user associated with the location has to make a second lookup given the ID. It looks like this now: [code/schema], and it's 30% faster than the joiny code. 
+
+To support right now's frenetic growth, we needed even more scalability. A single host couldn't keep up with all the requests we were making at this point, so we switched over to MySQL Cluster. Here's how that looked: [etc].

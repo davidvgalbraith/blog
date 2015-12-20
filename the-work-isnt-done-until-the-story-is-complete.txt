@@ -1,0 +1,1 @@
+This is intended to be a screed about the dangers of programming by coincidence and the importance of having a full story before you commit any code.

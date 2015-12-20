@@ -1,0 +1,164 @@
+I do contract work for a company called "right now", the hot new hyper-local social network. right now enables you to link your right now profile to your Instagram, Snapchat, Twitter, Tumblr, Soundcloud, Pinterest, Facebook, and LinkedIn profiles. When you tap a link in a right now profile to an external social media profile, that profile opens in the appropriate app. I put this together one service at a time by wading through pages of documentation all over the internet, filling in the holes with StackOverflow questions. It would have been much easier if all the information had been centralized in one place. So I decided to record my learnings for posterity, creating the resource I had wanted. Here's how you can link your iOS app to the prevailing social media networks of 2015.
+
+Programmatic Profile Opening
+
+There are some common steps you have to take before opening any type of social media profile. First, you have to add the scheme to your Info.plist. This is some goofy Apple security thing, just do it and don't question it. Add a key called LSApplicationQueriesSchemes to your Info.plist file, and make the value of that key an array. Add the right magic string to this array for each app you want to be able to open. right now's LSApplicationQueriesSchemes contains the strings "fb", "twitter", "linkedin", "tumblr", "instagram", "pinterest", and "soundcloud". In the XML that Info.plist is stored in, it looks like this:
+
+<key>LSApplicationQueriesSchemes</key>
+<array>
+        <string>fb</string>
+        <string>twitter</string>
+        <string>linkedin</string>
+        <string>tumblr</string>
+        <string>instagram</string>
+        <string>pinterest</string>
+        <string>soundcloud</string>
+</array>
+
+If you skip this step, all your attempts to open other apps will be rejected. Sorry. Note that Snapchat is missing. This is because Snapchat hates developers, so they have no public API for opening the Snapchat app from another app. We will have to handle that integration in another way.
+
+Instagram
+
+Once you've got the right keys in your Info.plist, you can get to opening some profiles. Let's start with Instagram. Given an Instagram profile name, the iOS URL for that profile looks like "instagram://user?username={the profile name}". Here's the code we use to open Instagram profiles in full:
+
+-(void)openInstagram:(NSString*)name {
+    NSString* string = [NSString stringWithFormat:@"instagram://user?username=%@",name];
+    NSURL* url = [NSURL URLWithString:string];
+
+    if ([[UIApplication sharedApplication] canOpenURL:url])
+    {
+        [[UIApplication sharedApplication] openURL:url];
+    }
+}
+
+Snapchat
+
+Snapchat is a tricky one. As mentioned, there is no public API for opening the Snapchat app from another app. So all we do at right now is, when you tap a Snapchat link in a right now profile, that user's Snapchat username is copied into the clipboard. The idea is that you will then open Snapchat on their own and paste the username in. Then you can start sending messages to that user. We pop up a little alert with messaging that says this. It's not ideal, but it is all we were able to come up with to integrate with the secretive Snapchat. The code is simple:
+
+-(void)openSnapchat:(NSString*)name {
+    [UIPasteboard generalPasteboard].string = name;
+}
+
+Twitter 
+
+Twitter is simple, like Instagram. Here's how we open a Twitter profile:
+
+-(void)openTwitter:(NSString*)name {
+    NSString* string = [NSString stringWithFormat:@"twitter://user?screen_name=%@",name];
+    NSURL* url = [NSURL URLWithString:string];
+    
+    if ([[UIApplication sharedApplication] canOpenURL:url])
+    {
+        [[UIApplication sharedApplication] openURL:url];
+    }
+}
+
+Tumblr
+
+Here's how we open a Tumblr profile: 
+
+-(void)openTumblr:(NSString*)name {
+    NSString* string = [NSString stringWithFormat:@"tumblr://x-callback-url/blog?blogName=%@",name];
+    NSURL* url = [NSURL URLWithString:string];
+    
+    if ([[UIApplication sharedApplication] canOpenURL:url])
+    {
+        [[UIApplication sharedApplication] openURL:url];
+    }
+}
+
+Easy!
+
+Soundcloud
+
+Soundcloud is a bit messy because Soundcloud usernames are not unique. So the user can't just provide their Soundcloud username, because that might link to somebody else's profile or nowhere at all. But each soundcloud profile has a unique URL extension, i.e. https://soundcloud.com/{unique URL extension}, so we can open profiles based on this. It's a little complicated -- first we have to hit Soundcloud's "resolve" API to tranform the URL into a user ID, then we can open the profile based on this user ID. Given a URL extension, here's how we open the corresponding profile in the iOS Soundcloud app:
+
+-(void) openSoundCloud:(NSString*) name {
+    NSString* path = [NSString stringWithFormat:@"resolve?url=http://soundcloud.com/%@&client_id=4e80b412364cb0403eef3116c97202b9", name];
+    [[NetworkingManager soundcloudManager] GET:path parameters:nil success:^(NSURLSessionDataTask *task, id responseObject) {
+        NSString* string = [NSString stringWithFormat:@"soundcloud:users:%@", [responseObject objectForKey:@"id"]];
+        NSURL* url = [NSURL URLWithString:string];
+        if ([[UIApplication sharedApplication] canOpenURL:url]) {
+            [[UIApplication sharedApplication] openURL:url];
+        } else {
+            NSLog(@"couldn't open %@", string);
+        }
+    } failure:^(NSURLSessionDataTask *task, NSError *error) {
+        NSLog(@"Error retrieving soundcloud info %@", error);
+    }];
+}
+
+The NetworkingManager is a wrapper we wrote around the AFNetworking library. You can plug in any class that can perform HTTP GET requests there.
+
+Pinterest
+
+Pinterest is similar to Soundcloud in that user profile names are not unique, but URL extensions are. Given a Pinterest URL extension, it's easy to open the corresponding profile in the Pinterest app:
+
+-(void)openPinterest:(NSString*)name {
+    NSString* string = [NSString stringWithFormat:@"pinterest://user/%@",name];
+    NSURL* url = [NSURL URLWithString:string];
+    
+    if ([[UIApplication sharedApplication] canOpenURL:url])
+    {
+        [[UIApplication sharedApplication] openURL:url];
+    }
+
+}
+
+Facebook
+
+Integrating with Facebook is a long and arduous process, but they've documented it very well. Basically they make a unique user ID for each Facebook user for each app that user want to connect to. To get them to do this for you, you have to register your app with them and hit some specific APIs in your code. I won't attempt to describe all the hoops you have to jump through here. Instead, I'll refer you to Facebook's documentation: https://developers.facebook.com/docs/ios/getting-started. 
+
+LinkedIn
+
+LinkedIn is complicated, like Facebook. Unlike Facebook, the documentation is terrible, so I'll try to help you out here as much as I can. To start with, like you did for Facebook, you'll have to register your app with LinkedIn and download their SDK. Do that here: https://developer.linkedin.com/docs/ios-sdk. That will get you a client ID and client secret, which you'll need to talk to LinkedIn. Once you've done that, here's how we get a profile ID and open that profile:
+ -(void) linkedinLoginClicked {
+    LIALinkedInApplication *application = [LIALinkedInApplication applicationWithRedirectURL:@"http://www.rightnow.one" clientId:@"{your client ID}" clientSecret:@"{your client secret}" state:@"{this can be whatever you want}" grantedAccess:@[@"r_basicprofile"]];
+    LIALinkedInHttpClient* client = [LIALinkedInHttpClient clientForApplication:application presentingViewController:self];
+    [client getAuthorizationCode:^(NSString *code) {
+        [client getAccessToken:code success:^(NSDictionary *accessTokenData) {
+            NSString *accessToken = [accessTokenData objectForKey:@"access_token"];
+            [client GET:[NSString stringWithFormat:@"https://api.linkedin.com/v1/people/~?oauth2_access_token=%@&format=json", accessToken] parameters:nil success:^(AFHTTPRequestOperation *operation, NSDictionary *result) {
+            // so result has this entry called "id", but it's trash. The real
+            // ID is hidden in a URL in a nested object that looks like
+            /*     siteStandardProfileRequest =     {
+             url = "https://www.linkedin.com/profile/view?id=237902852&authType=name&authToken=65Gr&trk=api*a4621901*s4938621*";
+             };
+             */
+            // (so the ID is 237902852 in this example) so here we decode this URL and pull out the ID
+            NSMutableDictionary *queryStrings = [[NSMutableDictionary alloc] init];
+            NSString* profileUrlString = [[result objectForKey:@"siteStandardProfileRequest"] objectForKey:@"url"];
+            NSURL* url = [NSURL URLWithString:profileUrlString];
+            for (NSString *qs in [url.query componentsSeparatedByString:@"&"]) {
+                NSString *key = [[qs componentsSeparatedByString:@"="] objectAtIndex:0];
+                NSString *value = [[qs componentsSeparatedByString:@"="] objectAtIndex:1];
+                value = [value stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+                value = [value stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+                
+                queryStrings[key] = value;
+            }
+
+            NSString* name = [NSString stringWithFormat:@"%@", [queryStrings objectForKey:@"id"]];
+            NSString* string = [NSString stringWithFormat:@"linkedin://profile?id=%@", name];
+            NSURL* url = [NSURL URLWithString:string];
+
+            if ([[UIApplication sharedApplication] canOpenURL:url]) {
+                [[UIApplication sharedApplication] openURL:url];
+            }
+
+            } failure:^(AFHTTPRequestOperation *operation, NSError *error) {
+                NSLog(@"failed to fetch current user %@", error);
+            }];
+        } failure:^(NSError *error) {
+            NSLog(@"Querying accessToken failed %@", error);
+        }];
+    } cancel:^{
+        NSLog(@"Authorization was cancelled by user");
+    } failure:^(NSError *error) {
+        NSLog(@"Authorization failed %@", error);
+    }];
+}
+
+Hideous! But that's what works for us. I hope it gets you started too. 
+
+So that's how you can connect your iOS app to the prevailing social media services in 2015. Happy networking!
