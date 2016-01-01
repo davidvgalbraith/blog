@@ -66,3 +66,125 @@ e.on('hello', function() {});
 
 That's it! Somehow that script managed to crash node with the message "console.error is not a function". My mission was to figure out how, and to fix it.
 
+By following the stack trace in the exception, I ended up in the addListener function of the EventEmitter, where it logs the warning about too many listeners. I determined that when this function was being called, the global console was an empty object. Since an empty object has no "error" function, or any functions at all, this triggered the exception. But how could the global console be empty? I had to find where the global console gets set up and accessed. I finally tracked it down at the very heart of Node: the actual Javascript file called node.js. There I found a call during Node's initialization phase to startup.globalConsole(), a function that looked like this:
+
+  startup.globalConsole = function() {
+    global.__defineGetter__('console', function() {
+      return NativeModule.require('console');
+    });
+  };
+
+Global and require
+
+Every node.js program has access to an object called "global" that contains information about the program. You can see it if you run `node -e 'console.log(global)'`. All global variable references in Node are actually property accesses on the global object. Check it out:
+
+$ node
+> global.x 
+undefined
+> var x = 1;
+undefined
+> global.x
+1
+> global.y = 2;
+2
+> y
+2
+
+So when a program refers to "console", it is actually referring to the "console" property of the global object. The startup.globalConsole function sets this property, defining what a reference to it returns: something called NativeModule.require('console'). Elsewhere in the node.js file, I found the definition of NativeModule.require. Here are the relevant parts:
+
+  NativeModule.require = function(id) {
+    var cached = NativeModule.getCached(id);
+    if (cached) {
+      return cached.exports;
+    }
+
+    var nativeModule = new NativeModule(id);
+
+    nativeModule.cache();
+    nativeModule.compile();
+
+    return nativeModule.exports;
+  };
+
+To make the startup process as lean as possible, Node doesn't finish setting up the console until the first time it is referenced. Then, it creates a new NativeModule object, caches it, and finishes setting it up by calling compile(). Any references to console after the first receive the cached object, so we don't have to call compile() again. Let's see this compile() method for ourselves:
+
+  NativeModule.prototype.compile = function() {
+    var source = NativeModule.getSource(this.id);
+    source = NativeModule.wrap(source);
+
+    var fn = runInThisContext(source, {
+      filename: this.filename,
+      lineOffset: 0
+    });
+    fn(this.exports, NativeModule.require, this, this.filename);
+
+    this.loaded = true;
+  };
+
+  NativeModule.wrap = function(script) {
+    return NativeModule.wrapper[0] + script + NativeModule.wrapper[1];
+  };
+
+  NativeModule.wrapper = [
+    '(function (exports, require, module, __filename, __dirname) { ',
+    '\n});'
+  ];
+
+Now this is a very deep bit of code, so let's break it down. NativeModule.getSource returns the source code for the module as a string. For console, that's the contents of the file console.js. Then NativeModule.wrap adds a line to the beginning and end of the source code, wrapping it in a function. The arguments to this function include the magical module and require variables we were talking about earlier! Finally, runInThisContext is essentially the same as eval(): it turns this function-wrapped source code string into an actual Javascript function. We call this actual Javascript function passing NativeModule.require as the require argument and the caller itself as the module argument. So when console.js requires another file, that's actually a recursive call to NativeModule.require. And when it modifies module.exports, it is actually modifying the exports property on the NativeModule object that node.js created for it. 
+
+Things fall apart
+
+So that's all very smart, but let's see how it caused our program to crash. Take another look at the require() function: note that it caches the module before compiling it. Before compile() is called, the module's exports is an empty object. What would happen if a file referred to console during the execution of console's compile()? Well, by the getter defined in globalConsole(), this would result in a call to NativeModule.require('console'), which would return NativeModule's cached entry for 'console'. But compilation isn't finished yet! So the cached entry is still an empty object. So if someone called console.error() during console's compile(), it would crash with the error "console.error is not a function". I had a hunch this was what was going on. 
+
+To confirm my suspicions, I had to trace through console.js for any chain of reference that might end up referring to console. I finally found it in the second-to-last line of the file:
+
+module.exports = new Console(process.stdout, process.stderr);
+
+Looks harmless! Is not harmless. Check out the getter functions for process.stdout and process.stderr, defined in the node.js file (edited for brevity):
+
+    process.__defineGetter__('stdout', function() {
+      if (stdout) return stdout;
+      stdout = createWritableStdioStream(1);
+      if (stdout.isTTY) {
+        process.on('SIGWINCH', function() {
+          stdout._refreshSize();
+        });
+      }
+      return stdout;
+    });
+
+    process.__defineGetter__('stderr', function() {
+      if (stderr) return stderr;
+      stderr = createWritableStdioStream(2);
+      if (stderr.isTTY) {
+        process.on('SIGWINCH', function() {
+          stderr._refreshSize();
+        });
+      }
+      return stderr;
+    });
+
+As with the global console, process.stdout and process.stderr are initialized only when referenced. Since this is the first reference in our program to stdout and stderr, they are created here. stdout.isTTY and stderr.isTTY are true when running a script from a file, so each getter adds a SIGWINCH event to process. But wait! We already set the defaultMaxListeners property to 1, so the addition of these two SIGWINCH events causes another warning about going over the maxListeners threshold. This all is happening during the compilation of the global console, after NativeModule.require has cached the empty object but before it has filled in the properties of that object with the console functions. So the code that attempts to log this second warning receives the cached empty object and fails with "console.error is not a function". Mystery solved!
+
+The Fix
+
+Now that I knew what was going on, I had to get it working right. My first instinct was to always compile the global console during node.js's setup phase, so we'd be unable to ever hit this case. That would fix this bug and any like it. But I thought about it more, and this seemed like the bug was too small to warrant such a major change: all node.js programs would have to pay the extra startup cost of compiling the global console up front, just so the programs that set EventEmitter.defaultMaxListeners to 1 wouldn't crash. Not worth it! 
+
+So then I wanted to change the site where the max listeners warning is logged, so that it would check if console.error existed before calling it. This had the advantage of not impacting startup time while still keeping the program from crashing. But it had the disadvantage that any warnings that occurred while the console was not yet compiled would be silently ignored. Ideally, the console would always be ready to log these warnings when they occur.
+
+So I came to my final solution: I implemented a setter for the EventEmitter.defaultMaxListeners property. Whenever a program sets this property, my setter is called. Here's how it looks:
+
+var defaultMaxListeners = 10;
+
+Object.defineProperty(EventEmitter, 'defaultMaxListeners', {
+  enumerable: true,
+  get: function() {
+    return defaultMaxListeners;
+  },
+  set: function(arg) {
+    console;
+    defaultMaxListeners = arg;
+  }
+});
+
+So the set() function contains the apparently-inert line console;, which only has the invisible effect of compiling the console if it does not exist. With this change to the EventEmitter class, our program no longer crashes with "console.error is not a function" and logs the expected warning. I pushed a commit with this change, opened a pull request, and received universal acclaim. Just like that, I'd fixed node.js again!
