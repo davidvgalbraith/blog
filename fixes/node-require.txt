@@ -1,0 +1,68 @@
+How node.js require() works -- and when it goes awry
+
+One of the most important features of node.js that is missing from pure Javascript is the require() function. The require() function, like #include in C and import in python, allows you to reference functions and objects defined in another file. Using it is a little more complex than using #include or import: to make something available to other files, you have to set it as a property on the magical module.exports object. 
+
+Here's an example: let's say we have two files (in the same directory), library.js and main.js, and main.js want to call the function printHello() defined in library.js. library.js would look like this:
+
+function printHello() {
+    console.log('Hello!');
+}
+
+module.exports = {
+    printHello: printHello
+};
+
+And main.js would look like this:
+
+var library = require('./library');
+
+library.printHello();
+
+And you'd run it as follows:
+
+$ node ./main.js
+Hello!
+
+Bam! Not so complicated, once you get used to it. But where does that magic module variable come from? How does require() work behind the scenes? I learned the answers to those questions and more in today's adventure.
+
+console.error is not a function?
+
+As usual, I was browsing the node.js issues page when I came across (link). The project owner (jasnell) had identified a small script that unexpectedly crashed with the confusing message "console.error is not a function", and the collaborator (vkurchatkin) whittled it down to a minimal test case. 
+
+(subheader) Events
+
+The script dealt with node's events module, which is node's implementation of event-driven programming. Events are easy to understand: you start with an object called an EventEmitter, which the events module provides. You can add "event listeners" to an EventEmitter with the on method. An event listener is a function that gets called when the EventEmitter emits a particular event, identified by a string. Then when the EventEmitter calls emit() on an event string, all the listeners on that event get called. Here's a simple example:
+
+// events-example.js
+var events = require('events');
+
+// get an event emitter
+var e = new events.EventEmitter();
+
+// add some listeners on the 'hello' event
+e.on('hello', function() { console.log('first listener'); });
+e.on('hello', function() { console.log('second listener'); });
+
+// fire the 'hello' event -- this will trigger the listeners
+e.emit('hello');
+
+Running it:
+
+$ node ./events-example.js 
+first listener
+second listener
+
+Bam! Pretty cool stuff. Events are a big part of programming in node.js: for instance, you can use them to define what your server does when a request comes in, which triggers a 'connection' event.
+
+EventEmitters have one more feature we'll need to be aware of: the maxListeners property. If you try to add more than maxListeners to a single event, then the EventEmitter will log a warning. maxListeners is a bit of a misnomer as the EventEmitter still adds the listener and will call it when the event is triggered, so it's not a hard maximum. It's the logging we're interested in here, though. You can see it in action by adding 9 more calls to e.on('hello') in my script above. By default, the maxListeners for any given event is 10. You can modify this number for a specific EventEmitter with the setMaxListeners method, or you can change the default by setting the defaultMaxListeners property on the events module itself. The buggy script in question did just that: without further ado, here it is:
+
+var events = require('events');
+events.defaultMaxListeners = 1;
+
+var e = new events.EventEmitter();
+
+e.on('hello', function() {});
+e.on('hello', function() {});
+
+That's it! Somehow that script managed to crash node with the message "console.error is not a function". My mission was to figure out how, and to fix it.
+
