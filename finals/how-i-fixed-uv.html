@@ -1,0 +1,49 @@
+It was another lazy, rainy winter afternoon, so once again I was looking to make the world of node.js a better place. Browsing the issues, I was struck by the bizarreness of <a href="https://github.com/nodejs/node/issues/4291">#4291</a>. The user <a href="https://github.com/anseki">anseki</a> had written a script that read the next line the user types into the <a href="https://en.wikipedia.org/wiki/Terminal_emulator">terminal</a>, but if you resized the window running the program while it was waiting for input, the program crashed with a <a href="https://en.wikipedia.org/wiki/Segmentation_fault">segmentation fault</a>.
+
+<!--more-->
+
+Here is a simplified version of the script, with some added annotations:
+<pre>var fs = require('fs'); // node.js's module for interacting with the filesystem (including the terminal)
+var buffer = new Buffer(1024); // instantiate a Buffer object, which fs writes data into
+
+process.stdout; // this line seems to do nothing, but the segmentation fault only happens when it's present
+
+var readSize = fs.readSync(fs.openSync('/dev/tty', 'r'), buffer, 0, bufferSize); // receive some input from the user and write it into buffer
+var chunk = buffer.toString('utf8', 0, readSize); // turn the buffer into a string to get a pretty log message
+
+console.log('INPUT: ' + chunk);</pre>
+Segmentation faults happen in <a href="https://en.wikipedia.org/wiki/C_%28programming_language%29">C</a> when a program makes an invalid memory access. So somehow, resizing the window triggered an invalid C memory access from this Javascript program. Most untoward!
+<h3>The C part of Node</h3>
+Node.js features several handy libraries for building server applications, such as the <a href="https://nodejs.org/api/fs.html">fs</a> and <a href="https://nodejs.org/api/http.html">http</a> modules. These modules are implemented by calling functions from a library called <a href="https://github.com/joyent/libuv">libuv</a>. libuv is an input/output handling module that deals directly with the operating system. It is written in C, so it is the place to look if you encounter any segmentation faults using node.js. The node.js collaborator <a href="https://github.com/evanlucas">evanlucas</a> did some basic profiling to find the line where the segmentation fault happened: apparently it was a null pointer access on line 275 of libuv/unix/fs.c:
+<pre>result = read(req-&gt;file, req-&gt;bufs[0].base, req-&gt;bufs[0].len);</pre>
+When the window was resized while our program was running, that line executed with <tt>req-&gt;bufs</tt> having the value <tt>NULL</tt>. It was up to me to figure out how that happened.
+<h3>The search</h3>
+First, I figured out what the <tt>req</tt> structure is: it's a <a href="http://docs.libuv.org/en/v1.x/request.html">uv_req_t</a>, a container that libuv uses to encapsulate data about a filesystem request. <tt>req-&gt;file</tt> is the <em>file descriptor</em> for the file that the request is accessing. A file descriptor is a number that the operating system provides to programs that perform operations on files. If a program performs an operation on a file descriptor, the operating system performs the operation on the appropriate file. So <tt>req-&gt;file</tt> in this case is the file descriptor for <tt>/dev/tty</tt> (the terminal input), since that's the file that the Javascript code is attempting to read from.
+
+Next, <tt>req-&gt;bufs</tt> is an array of <a href="http://docs.libuv.org/en/v1.x/misc.html#c.uv_buf_t"><tt>uv_buf_t</tt></a> objects. <tt>uv_buf_t</tt> is libuv's structure for buffering data. A <tt>uv_buf_t </tt>object has a byte array called <tt>base</tt> and a property called <tt>len</tt> representing the number of bytes in the array. So <tt>req-&gt;bufs</tt> is an array of <tt>uv_buf_t</tt>s that store the data that the request is interested in. Putting it all together, our <tt>read</tt> command is supposed to take <tt>req-&gt;bufs[0].len</tt> bytes from the terminal input and place them in <tt>req-&gt;bufs[0]</tt>. But as we've seen, in my script <tt>req-&gt;bufs</tt> is <tt>NULL</tt> rather than a valid array of <tt>uv_buf_t</tt>s after resizing the terminal. So the attempt to access the <tt>base</tt> and <tt>len</tt> of the first element of <tt>NULL</tt> triggers a segmentation fault.
+
+I had to find out how <tt>req<tt>-&gt;</tt>bufs</tt> was being <tt>NULL</tt>ified. I searched through fs.c for the string "req-&gt;bufs =" to find all the places where <tt>req-&gt;bufs</tt> gets assigned any value. I found a very suspsicious one at the end of a function called <tt>uv__fs_buf_iter</tt>:
+<pre>req-&gt;bufs = NULL;</pre>
+That seemed likely to be the place where <tt>req-&gt;bufs</tt> was being set to <tt>NULL</tt>. Tracing through the code further, I found that the API function <tt>uv_fs_read</tt> calls a function <tt>uv__fs_work</tt>, which calls<tt> uv__fs_buf_iter</tt>. <tt>uv__fs_buf_iter</tt> in turn calls <tt>uv__fs_read</tt> (note the double underscore after uv, so this is different from the API function). <tt>uv__fs_read</tt> finally does the actual reading work, including the call to C's <a href="http://pubs.opengroup.org/onlinepubs/009695399/functions/read.html"><tt>read</tt></a> function that we saw on line 275 above. When <tt>uv__fs_read</tt> is finished, <tt>uv__fs_buf_iter</tt> cleans up the resources that it used, including nullifying <tt>req-&gt;bufs</tt>. So if <tt>uv__fs_buf_iter</tt> were called twice on the same <tt>req</tt>, then <tt>req-&gt;bufs</tt> would be <tt>NULL</tt> during the second call, which would cause a segmentation fault.
+<h3>Read, interrupted</h3>
+So I looked for a way that <tt>uv__fs_buf_iter</tt> might be called twice on the same <tt>req</tt>. I found it in <tt>uv__fs_work</tt>. The body of <tt>uv__fs_work</tt> is a <tt>while</tt> loop that makes calls to various <tt>uv__</tt> functions, including <tt>uv__fs_buf_iter</tt>. The loop condition is <tt>while (r == -1 &amp;&amp; errno == EINTR &amp;&amp; retry_on_eintr)</tt>. If this condition were to hold after a call to <tt>uv__fs_buf_iter</tt>, we'd immediately make another call to <tt>uv__fs_buf_iter</tt> with the same <tt>req</tt> object.
+
+Here's a diagram of the chain of events I just described, leading to two calls to <tt>uv__fs_buf_iter</tt> on the same <tt>req:</tt>
+
+<img class="alignnone size-large wp-image-124" src="http://davidvgalbraith.com/wp-content/uploads/2016/01/eintrlopsnap2-1024x653.png" alt="eintrlopsnap2" width="840" height="536" />
+
+So I had to see if there was any way <tt>(r == -1 &amp;&amp; errno == EINTR &amp;&amp; retry_on_eintr)</tt> could hold after a call to <tt>uv__fs_buf_iter</tt>. First I had to figure out what it meant!
+
+The first statement in the condition, <tt>r == -1</tt>, refers to an <tt>int r</tt> declared earlier in <tt>uv__fs_work</tt>. <tt>uv__fs_work</tt> sets <tt>r</tt> to the return value of whatever <tt>uv__ </tt>function it calls. <tt>uv__fs_read</tt> returns the number of bytes read, or -1 if there was an error during the read. So <tt>r == -1</tt> indicates that there was an error during <tt>uv__fs_read</tt>.
+
+The next statement, <tt>errno == EINTR</tt>, refers to a global variable in C called <a href="http://man7.org/linux/man-pages/man3/errno.3.html"><tt>errno</tt></a> and its potential value, <a href="http://www.gnu.org/software/libc/manual/html_node/Error-Codes.html"><tt>EINTR</tt></a>. Whenever a call from C to the operating system completes, <tt>errno</tt> is set. It is set to 0 if the operation completed successfully, and it is set to something else if there was an error.
+
+<tt>EINTR</tt> is an <tt>errno</tt> value that means "Interrupted Function". It indicates that the read was interrupted by a <em>signal</em>. Signals in C are messages that the operating system can send to a program. When a program receives a signal from the operating system, it stops whatever it is doing to handle the signal. If a <tt>read</tt> is underway but hasn't received any data yet, as in the case of my program awaiting user input, then receiving a signal causes that <tt>read</tt> to fail and set <tt>errno</tt> to <tt>EINTR</tt>.
+
+The last part of our condition, <tt>retry_on_eintr</tt>, is always true for reads in libuv, because receiving a signal is usually orthogonal to a program's read activity. For instance, if we didn't retry reads on <tt>EINTR</tt>, then our original Javascript program would terminate when you resize the window. While that's a little better than segmentation faulting, it is still not the desired behavior, which is for the program to just keep waiting for input.
+
+With some further research, I found that resizing the terminal window causes the operating system to send a "window size change" signal to the program! Receiving this signal causes <tt>read</tt> to fail and set <tt>errno</tt> to <tt>EINTR</tt>, triggering the disastrous chain of events diagrammed above.
+<h3>The fix</h3>
+I decided that the dysfunctional link in this chain was when  <tt>uv__fs_buf_iter</tt> unconditionally freed the resources in the <tt>req</tt>. Before freeing the resources, it should check <tt>errno</tt> to determine whether the <tt>read</tt> is going to be retried: if so, it should keep the <tt>req</tt> object valid.
+
+So I cobbled together a pull request adding such a check to the end of <tt>uv__fs_buf_iter</tt>. The libuv maintainer <a href="https://github.com/indutny">indutny</a> said he had been working on just such a change too, but since I'd beaten him to the punch he'd code-review my pull request. We worked out the optimal place for the check to go, and he gave me some helpful tips for writing a unit test for the bug fix. Once I had the unit test working right, he and another maintainer <a href="https://github.com/saghul">saghul</a> suggested a few stylistic tweaks to get my new code to look like the rest of libuv's source. After I made those, they approved it! That's the story of how I fixed libuv.
