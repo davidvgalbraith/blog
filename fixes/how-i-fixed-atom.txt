@@ -1,0 +1,55 @@
+Atom is the hot new up-and-comer in the world of text editing. It is my editor of choice for making software, and it's open source, so I decided to check out its issues to see if there was anything I could contribute. I came across https://github.com/atom/atom/issues/10272: the Atom user speter had written a line of text that, when you pressed Enter at its end, caused Atom to calculate for half an hour before writing a new line. I was pretty stunned that such a simple and common operation could perform so atrociously, so I decided to jump in and figure out what was going on.
+
+The Search
+
+Here's the text in question: vVar.Type().Name() == "" && vVar.Kind() == reflect.Ptr && vVar.Type().Elem().Name() == "" && vVar.Type().Elem().Kind() == reflect.Slice. It's a line of code in Go, a new programming language created by Google. I'm not sure what it's supposed to do, but that's irrelevant here: all I care about is how pressing Enter at the end of that line could cause Atom to hang.
+
+Having very little to go on, I began the search by searching the whole codebase for the word "newline". After a few leads that went nowhere, I found the function responsible for writing new lines when the enter key is pressed, a function called insertNewLine in the file text-editor.coffee. Here's how it looked:
+
+  insertNewline: ->
+    @insertText('\n')
+
+Atom is written in CoffeeScript, a language I'd never worked with before. CoffeeScript is like Javascript without most of the keywords, parentheses and brackets. It uses whitespace to determine scope, like Python. It also supports classes. These two lines define a method of the TextEditor class called insertNewline. insertNewline just calls the class method insertText on a newline character. To make sure I was in the right place, I made a quick tweak to the method:
+
+  insertNewline: ->
+    console.log "Hello!"
+    @insertText('\n')
+    console.log "Goodbye"
+
+With this change, every time I typed Enter I saw the lines "Hello!" and "Goodbye" show up in Atom's console. But when I typed Enter at the end of the crashing line, I saw "Hello!" but no "Goodbye". This told me that something in the insertText method was causing the slowness. So I looked at the insertText method of TextEditor. TextEditor maintains an object called a Selection that manages keeps track of what text is currently selected, and the insertText method of TextEditor just calls the insertText method of this Selection. (Atom actually supports multi-select, so there can be any number of these Selection objects, but in my case there was only one).
+
+Selection.insertText is a pretty long method, but using my Hello/Goodbye logging I traced the issue to these lines at the end:
+
+    if options.autoIndentNewline and text is '\n'
+      @editor.autoIndentBufferRow(newBufferRange.end.row, preserveLeadingWhitespace: true, skipBlankLines: false)
+
+When writing a newline, this code calls back into TextEditor to determine the indentation for the new line. Atom tries to be smart about this indentation, based on scope (link here). If the new line is at the same scope as the previous line, it has the same indentation; if it enters a new scope, it's one tab more indented, and if it exits a scope, it's one level less indented. 
+
+TextEditor has an object called LanguageMode that keeps track of which programming language the file being edited is written in. LanguageMode knows the indentation rules and what entering and exiting scope looks like in its language, so the autoIndentBufferRow method of TextEditor just calls the autoIndentBufferRow method of LanguageMode.
+
+The autoIndentBufferRow method of LanguageMode calls LanguageMode's suggestedIndentForBufferRow method to calculate the indentation level, then calls the setIndentationForBufferRow method of TextEditor to set the indentation to this calculated level. My Hello/Goodbyes were telling me that the calculation step, suggestedIndentForBufferRow, was where the slowness was. suggestedIndentForBufferRow just calls the even-more-extravagantly-named suggestedIndentForTokenizedLineAtBufferRow, which does the real work of calculating the indentation. Here's a streamlined version of suggestedIndentForTokenizedLineAtBufferRow:
+
+  suggestedIndentForTokenizedLineAtBufferRow: (bufferRow, line, tokenizedLine, options) ->
+    iterator = tokenizedLine.getTokenIterator()
+    iterator.next()
+    scopeDescriptor = new ScopeDescriptor(scopes: iterator.getScopes())
+
+    increaseIndentRegex = @increaseIndentRegexForScopeDescriptor(scopeDescriptor)
+    decreaseNextIndentRegex = @decreaseNextIndentRegexForScopeDescriptor(scopeDescriptor)
+
+    precedingRow = bufferRow - 1
+    desiredIndentLevel = @editor.indentationForBufferRow(precedingRow)
+
+    unless @editor.isBufferRowCommented(precedingRow)
+      precedingLine = @buffer.lineForRow(precedingRow)
+      desiredIndentLevel += 1 if increaseIndentRegex?.testSync(precedingLine)
+      desiredIndentLevel -= 1 if decreaseNextIndentRegex?.testSync(precedingLine)
+
+    Math.max(desiredIndentLevel, 0)
+
+
+First it builds a ScopeDescriptor, an object encapsulating scope information about the current line. Based on this ScopeDescriptor, it gets the regular expressions increaseIndentRegex and decreaseNextIndentRegex. increaseIndentRegex matches lines that look like entering scope, and decreaseNextIndentRegex matches lines that look like exiting scope. So when the new line is entering a new scope, increaseIndentRegex?.testSync(precedingLine) is true, so desiredIndentLevel is incremented, and if the new line is exiting a scope, decreaseNextIndentRegex?.testSync(precedingLine) is true, so desiredIndentLevel is decremented. My final round of Hello/Goodbye told me that decreaseNextIndentRegex?.testSync(precedingLine) was the ultimate cause of my performance woes.
+
+Regular expressions
+
+// describe regular expressions, catastrophic overflow, introduce the decreaseNextIndentPattern, move on to the fix
