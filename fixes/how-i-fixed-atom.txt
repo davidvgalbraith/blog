@@ -1,4 +1,4 @@
-Atom is the hot new up-and-comer in the world of text editing. It is my editor of choice for making software, and it's open source, so I decided to check out its issues to see if there was anything I could contribute. I came across https://github.com/atom/atom/issues/10272: the Atom user speter had written a line of text that, when you pressed Enter at its end, caused Atom to calculate for half an hour before writing a new line. I was pretty stunned that such a simple and common operation could perform so atrociously, so I decided to jump in and figure out what was going on.
+Atom is the hot new up-and-comer in the world of text editing. It is my editor of choice for building software, and it's open source, so I decided to check out its issues to see if there was anything I could contribute. I came across https://github.com/atom/atom/issues/10272: the Atom user speter had written a line of text that, when you pressed Enter at its end, caused Atom to calculate for half an hour before writing a new line. I was pretty stunned that such a simple and common operation could perform so atrociously, so I decided to jump in and figure out what was going on.
 
 The Search
 
@@ -53,3 +53,70 @@ First it builds a ScopeDescriptor, an object encapsulating scope information abo
 Regular expressions
 
 // describe regular expressions, catastrophic overflow, introduce the decreaseNextIndentPattern, move on to the fix
+Regular expressions are a tool for testing whether a string matches a pattern. Their syntax is a little wonky, but they're immensely powerful. Here's a small example to get us warmed up: 
+
+^[^b]+. 
+
+That matches any nonempty string that doesn't start with the letter "b". So it'll match "apples", but not "bananas", for instance. Breaking it down, the initial ^ means "start of the string", meaning the match has to start at the beginning of the string. Without the initial ^, the regular expression would match any string that contains any character other than "b", including "bananas". Then -- and this is one reason regular expressions are so tricky, the overloaded operators -- the ^ inside the brackets means "negate", so [^b] means "not the letter b". Finally, the + at the end means "at least one". So this regular expression matches "bananas", "bbbananas", and any number of initial bs. 
+
+With decreaseNextIndentRegex, Atom wants to match a line if it has unbalanced parentheses, closing more than it opens. Here's an example:
+
+someObject.someFunction(arg1,
+    arg2,
+    arg3)
+
+It's pretty common style to have one argument per line like this, especially if instead of "arg1" etc. you had really long argument names. The arg2 and arg3) lines are indented to make it clear they are part of the argument list. arg3) is unbalanced in favor of closed parentheses, so it matches decreaseNextIndentRegex: when you press Enter at the end of that line, Atom will indent the new line back at the level of someObject.
+
+Ok, are you ready for decreaseNextIndentRegex? You are not -- no one can ever be ready for decreaseNextIndentRegex. But take a deep breath, because here it is, as I found it:
+
+^\s*[^\s()}]+(?<m>[^()]*\((?:\g<m>|[^()]*)\)[^()]*)*[^()]*\)[,]?$
+
+Oof. I must admit, I almost called it quits when I saw that beast. But then I figured, I'd come this far, might as well see this thing through. Let's see if we can break that down into somewhat-manageable chunks:
+
+^\s*: As we've seen, ^ means the start of a string. \s is the whitespace pattern. It matches tabs, spaces, etc. * means "At least 0". So this matches any and all whitespace at the start of a string, such as the 4 spaces at the beginning of our arg3 line. 
+
+[^\s()}]+: Here we have a [^, which again means "not any of these characters". So [^\s()}] means any character that isn't whitespace or a parenthesis or a }. The + again means "at least one".
+
+(?<m>[^()]*\((?:\g<m>|[^()]*)\)[^()]*): All right, buckle up. What if instead of the simple arg3), our final argument was itself the result of evaluating a function or functions? For instance:
+
+someObject.someFunction(arg1,
+    arg2,
+    f1(f2(xyz), abc).def)
+
+The goal of this chunk of decreaseNextIndentRegex is to match function calls like f1(f2(xyz), abc), no matter how deeply they nest. It does this with a named capture group, defined by (? and named by <m>. <m> is the name of this whole chunk of decreaseNextIndentRegex. <m> wants to match function calls to any depth. The first component of <m> is [^()]*. This matches any number of non-parenthesis characters. In our example, that's "f1". The next component of <m> is \(, which means a ( character such as the one following f1. 
+
+Matching the ( puts us inside the arguments of a function, so now we have to match strings that look like function arguments. The arguments to a function can be simple lists of characters, like the xyz argument to f2, or they can be function calls themselves, like the f2(xyz) argument to f1. <m> needs to match either of these after the (. For simple lists of characters, it can use [^()]* to look for any number of characters other than parentheses. But how can <m> match a function call? And that function call might have other function calls as its arguments, so the expression we use needs to match function calls to any depth. But we have an expression that matches function calls to arbitrary depth -- it's called <m>! 
+
+That's how (?:\g<m>|[^()]*) matches the arguments of a function. | is the alternation operator, which means "either the thing on the left of me or the thing on the right of me". On the left side of | is \g<m>, a recursive reference to <m> for the case where the arguments to our function are function calls, and on the right side of | is [^()]* for the case where the arguments are simple strings. I hope that makes some sense: I had to meditate on it at length before I understood at all.
+
+After the arguments-matcher (?:\g<m>|[^()]*), <m> looks for a ) character to close the arguments list, represented as \). The last bit of <m> is another [^()]*. This is to cover the case like ours where a function has multiple arguments, one a function call and the other a string. Then (?:\g<m>|[^()]*) would match the function call, leaving the string unmatched. With this extra [^()]* on the end of <m>, the string gets matched too.
+
+After <m>, we have yet another [^()]*. This is to match any characters that show up between the function call(s) that <m> matched and the end of the line. In our example, this [^()]* matches .def.
+
+After our last [^()]*, we have one more \). This is the extra ) that makes the line parenthetically unbalanced: remember that detecting lines with more ) than ( was the whole goal of decreaseNextIndentRegex. 
+
+At the very end, there's [,]?$. [,]? matches zero or one comma characters, and $ matches the end of the string. So after the unbalancing ), the only character that is allowed in the string for decreaseNextIndentRegex to match it is an optional comma.
+
+Phew! We made it all the way through decreaseNextIndentRegex. Great work!
+
+Catastrophe strikes
+
+But of course the whole reason we're here is because there's something wrong with decreaseNextIndentRegex: it's ridiculously slow at matching our string vVar.Type().Name() == "" && vVar.Kind() == reflect.Ptr && vVar.Type().Elem().Name() == "" && vVar.Type().Elem().Kind() == reflect.Slice. I hadn't the faintest idea what might cause this, so I just Googled for "regular expression performance". I ended up at https://regex101.com/, a super-nifty site where you can input regular expressions and strings and the sit e analyzes the matching. When I input decreaseNextIndentRegex and that string, it said "Catastrophic backtracking detected". That didn't sound good.
+
+regex101.com pointed me to (link), which has a thorough explanation of the catastrophic backtracking phenomenon. I won't cover the cause in depth here, but it's a problem that afflicts regular expressions that are careless with their * operators. Basically, it happens if you use the * operator on a sequence of patterns that have * operators of their own, and the nested *ed expressions overlap (meaning there's a string that matches more than one of them). In this case, the cost of identifying a string that doesn't match the overall regular expression but does match both starred subexpressions becomes exponential in the length of the string. For a simple example, the regular expression ([a]*[ab]*)*c will hit catastrophic backtracking if you give it a string with a bunch of `a`s, since either the [a]* or the [ab]* could match an a.
+
+Let's see how catastrophic backtracking was affecting decreaseNextIndentRegex. To simplify the question, I removed pieces of decreaseNextIndentRegex until I found a minimal set that still resulted in catastrophe. I was able to delete almost all of it and still see catastrophic backtracking, until all that remained was:
+
+^([^()]*\(\)[^()]*)*\)$
+
+With this minimal problematic expression, I could see what was causing the catastrophe. We use * on a pattern that contains two [^()]*s! In between the two is a (), so we only hit catastrophic backtracking with a string that has a lot of () in it, as our vVar.Type().Name()... string does.
+
+The fix
+
+To prevent catastrophic backtracking, one of the [^()]*s making up <m> had to go. But I couldn't just take it out without changing the set of strings that decreaseNextIndentRegex matched, which wouldn't be good. Remember why the second [^()]* is there: to cover the case where a function has multiple arguments, one a function call and the other a string. But in its current position, it tries to match the text following every function call. It only needs to match the text following a function call that is itself an argument to a function call. Remember, we detected these nested function calls with the recursive reference to <m>. So I moved the [^()]* to immediately after the <m>. This moved [^()]* still tries to match the text it needs to match, but it doesn't try to match text that is already covered by the other [^()]* in <m>. With the redundancy removed, catastrophic backtracking no longer occurs. The final decreaseNextIndentRegex looks like this:
+
+^\s*[^\s()}]+(?<m>[^()]*\((?:\g<m>[^()]*|[^()]*)\))*[^()]*\)[,]?$
+
+I put together a pull request with this change and a few extra tests and pushed it up to the language-go repository. The project collaborator (samsomething) agreed with my assessment and the fix, and we landed the change in (commit). Just like that, I had fixed Atom!
+
+This was surely the wildest adventure I've had so far in the open-source world. At the start, I had never seen CoffeeScript, and I only had a vague recollection of regular expressions left over from the two weeks we covered them in CS 164 at Berkeley all those years ago. By the end, I had read thousands of CoffeeScript lines, and I'd learned more about regular expressions than I even knew existed. Best of all, I got to fix a bizarre bug in my favorite text editor. What a trip!
