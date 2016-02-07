@@ -1,0 +1,68 @@
+Lest you think I'm only good for one-line bug fixes in large existing projects, today I'll share the story of a module I wrote all by myself: the ConcurrencyMaster.
+
+I was working on the Juttle Elastic Adapter's write processor. The write processor sits at the end of a Juttle pipeline. Its job is to make sure that points it receives are stored in Elasticsearch. In version 0.1, the processor just send a _bulk request to Elasticsearch every time it received some points. This simple implementation worked when only a few points were at stake, but Team Juttle's venerable QA team soon tried to stream hundreds of thousands of points from a file to Elasticsearch via the write processor. With so many points, the write processor created hundreds of requests to Elasticsearch and sent them all in parallel. This overwhelmed Elasticsearch's ability to process requests, and about 30% of the points were dropped due to request timeouts or task queue overflows in Elasticsearch. A better model was necessary. 
+
+I needed a way to control the number of concurrent requests that the write processor makes to Elasticsearch. My first thought was to just use Bluebird's Promise.map function, which calls a Promise-returning function on each element in an array. Promise.map takes a concurrency parameter specifying how many of these Promises can run in parallel, so it seemed like a good tool for limiting the write processor's concurrency. Upon further reflection, though, Promise.map was entirely unsuitable: points come into the write processor at irregular intervals, whereas Promise.map has to know up front all the objects in the array it is mapping over. For instance, if a batch of 10,000 points were sent to the processor, I could use Promise.map to split them into ten requests of size 1,000 and run say only 3 of them in parallel. But if 10,000 more points showed up while I was still sending the first 10,000, there's no way to add requests to the Promise.map handling the original points. So Promise.map couldn't manage the total concurrency of the processor's requests to Elasticsearch.
+
+With some meditation, I came up with an elegant scheme for managing total request concurrency. It looked something like this:
+
+constructor(options) {
+    this.write_index = 0;
+    this.writes = [];
+    for (var i = 0; i < options.concurrency; i++) {
+        this.writes.push(Promise.resolve());
+    }
+    // more setup ...
+}
+
+write(points) {
+    this.writes[this.write_index] = this.writes[this.write_index].then(() => {
+        return this._write(points); // the _write method handles the low-level Elasticsearch request logic
+    });
+    this.write_index = (this.write_index + 1) % this.concurrency;
+}
+
+In this code, the adapter has a fixed-size array with as many elements as it wants to make concurrent requests. Each element in this array is a Promise representing a request to Elasticsearch. Each of these Promises resolves when its underlying request completes. When new points come in, the adapter picks one of these Promises and chains a request to insert the new points after the chosen promise. So we don't start inserting a new set of points until after an old set of points finishes. Here's a diagram:
+
+That's how we enforce the concurrency requirement despite being unable to predict when more points will come in. 
+
+Reading the code, it occurred to me that the logic for maintaining these concurrent requests was a bit of complexity that didn't really belong in the Juttle Elastic Adapter. The Juttle Elastic Adapter just wants to write points to Elasticsearch, and the details of holding this array of promises and figuring out how to chain them to manage concurrency is more than it bargained for. Furthermore, other adapters that write to databases would likely need similar logic to avoid overwhelming their backends. So I decided to move the logic into its own class, and that's how the ConcurrencyMaster was born. Here's the ConcurrencyMaster, in all its glory:
+
+class ConcurrencyMaster {
+    constructor(concurrency) {
+        this.promises = [];
+        for (var i = 0; i < concurrency; i++) {
+            this.promises.push(Promise.resolve());
+        }
+        this.promise_index = 0;
+        this.concurrency = concurrency;
+    }
+
+    add(promise_func) {
+        this.promises[this.promise_index] = this.promises[this.promise_index].then(promise_func);
+        this.promise_index = (this.promise_index + 1) % this.concurrency;
+    }
+
+    wait() {
+        return Promise.all(this.promises);
+    }
+}
+
+The constructor takes a number argument specifying the desired concurrency and sets up the Promise array. Then the add method just takes a promise-returning function and chains a call to it after one of the array's Promises. Finally, wait() returns a Promise that resolves when every Promise function passed to add() has been called and resolved. Here's the Elastic Adapter write processor, rewritten to use the ConcurrencyMaster:
+
+constructor(options) {
+    this.concurrency_master = new ConcurrencyMaster(options.concurrency);
+    // more setup ...
+}
+
+write(points) {
+    var self = this;
+    var execute_write = function() { 
+        return self._write(points);
+    }
+    this.concurrency_master.add(execute_write);
+}
+
+We had to wrap the call to self._write in the function execute_write because the act of calling self._write sends the request to Elasticsearch. The ConcurrencyMaster has to be the one who decides when to make that call. 
+
+With this approach, the Juttle Elastic Adapter doesn't need to know anything about concurrency management, just that the ConcurrencyMaster will take care of it. The Juttle Elastic Adapter can keep its focus on talking with Elasticsearch, while the ConcurrencyMaster handles scheduling requests to keep the pace reasonable. We have two simple classes that do one thing well, and we have a handy reusable utility to help any other code that needs manage concurrency. Software, engineered!
