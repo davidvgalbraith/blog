@@ -1,0 +1,72 @@
+Object HashSet: the compact hashset for Node.js objects
+
+In today's adventure, we'll explore my single favorite piece of software that I've worked on: the Object HashSet. The Object HashSet is a native V8 Node.js addon. An Object HashSet accepts objects with the add method, and its contains method tells you whether a given object has already been added. The Object HashSet considers two points equal if all their keys and values are the same. It is designed to be as space-efficient as possible.
+
+Origins: Timeseries Data
+
+Once upon a time, I was building a timeseries database. Timeseries data consists of multiple measurements of the same quantity as it varies over time. For instance, if you sample the CPU usage on your computer every second for an hour, that's timeseries data. A timeseries database compactly stores timeseries data by mapping a description of a quantity to a list of that quantity's timestamped values.
+
+Jut's timeseries database was built with Elasticsearch and Cassandra. We stored quantity descriptions -- the technical term for which is row keys -- as JSON objects in Elasticsearch, and in Cassandra we stored serialized representations of these row keys mapped to lists of timestamped values. This was because we wanted full-text search on row keys, but we didn't want to pay the full cost of storing every data point as a document in Elasticsearch. Writing just a time and value to a row in Cassandra is over an order of magnitude more space- and time-efficient than writing a document to Elasticsearch.
+
+The timeseries database was a long-running process that accepted points to write over a JSON API. When storing a point in our timeseries database, we first calculated the object representing its row key by removing the time and value fields, and we serialized this object into a string. We stored the object in Elasticsearch with the _id field set to the serialized string. Elasticsearch only allows one document to have a particular _id field, so this operation gave us only one document per quantity. Then we stored the time and value fields as values for the row key string in Cassandra.
+
+This still adds up to a lot of unnecessary work with Elasticsearch. The only useful work we were doing with all these upserts was for the very first data point received for a given quantity. After that, we were just sending repeat documents to be rejected. Even these rejections were 4x slower than writes to Cassandra, so it was performance-critical to stop doing them.
+
+To avoid sending unnecessary requests to Elasticsearch, the orginal version of the timeseries database kept a Javascript object in memory that it used as a cache.  When it sent a document to Elasticsearch, it stored that document's row key string as a key in this object. It only sent subsequent documents to Elasticsearch if it hadn't already sent a document for the same row key. Basically, we performed the in memory the same _id lookup that Elasticsearch would have done to determine whether to store the row key or reject it as conflicting with an existing one. Each time the database started, it endured a bried period of making requests to Elasticsearch, after which it had seen all the row key it was going to see and so didn't have to talk to Elasticsearch anymore. Speedy!
+
+Big Data Too Big
+
+Then one day, our largest customer decided to crank up their data feed so that it had 7 million row keys. Orestes attempted to put all those keys into its cache object, exceeding Node.js's 1.5 GB memory limit and crashing the process. We needed a more compact way to encode and store these objects.
+
+Studying the data, I found a few patterns that enabled it to be represented more efficiently. The set of all the keys among all the objects was rather small, as was the set of values of each key. The Cartesian product of these individually small sets added up to the 7 million distinct objects we were trying to store. When we were storing the whole row keys, we were repeating these same key and value strings over and over, just in differing combinations. I got the notion that we could store the full key/value strings only once, and we could encode an object just by referring to the subset of these that it contains. The resulting data structure is the Object HashSet.
+
+Architecture
+
+The Object HashSet consists of two internal tables: the Strings Table and the Attributes Table. The Strings Table maps the name of a key to a tuple with two values. The first value in the tuple for a given key is the sequence number for that key. The first key added to the Strings Table has sequence number one, the second has sequence number two, and so forth. The second value in the tuple for a given key is another hash set. This hash set maps the names of values to the sequence numbers of those values. For a given key, the first value of this key that the Strings Table sees has sequence number one, the second has sequence number two, and so forth.
+
+The Attributes Table encodes streams as associations between entries in the Strings Table. It's best illustrated with an example.
+
+var bubo = new Bubo();
+
+bubo.add({host: 'bananas', pop: 'pajamas', name: 'kittens'});
+/* after the first point, Bubo's strings table looks like:
+{
+	host: [1, {bananas: 1}],
+	pop: [2, {kittens: 1}]
+	name: [3, {pajamas: 1}],
+}
+
+and its attributes table is a hash set consisting of the single entry {1->1, 3->1, 2->1} (the associations are ordered in the alphabetic order of the corresponding keys)
+*/
+
+bubo.add({host: 'bananas', pop: 'pajamas', name: 'mittens', anotherTag: 'potatoes'}, result);
+/* after the second point, Bubo's strings table looks like:
+{
+	host: [1, {bananas: 1}],
+	pop: [2, {kittens: 1, mittens: 2}],
+	name: [3, {pajamas: 1}],
+	anotherTag: [4, {potatoes: 1}]
+}
+
+and its attributes table is a hash set consisting of the entries {1->1, 3->1, 2->1} and {4->1, 1->1, 3->1, 2->2}
+*/
+
+The encoding of the associations in the Attributes Table comes from Google's ProtoBuffer. The ProtoBuffer encoding is a compact way to encode sequences of integers, especially small ones. It uses the low-order seven bits of a byte to encode part of a value. If the high-order bit of the byte is 0, those seven bits are the whole encoded value. If the high-order bit is 1, then you shift those seven bits to the left by seven and OR with the low-order seven bits of the next byte to get the next part of the encoded value, and you repeat as necessary until you find a high-order bit that is 0. Here's the code that implements this:
+
+inline void encode_packed(uint32_t val, char* out, int* outlen) {
+    int length = 1;
+    while (val >= 0x80) {
+        *out = static_cast<uint8_t>(val | 0x80);
+        val >>= 7;
+        out++;
+        length++;
+    }
+    *out = static_cast<uint8_t>(val);
+    *outlen = length;
+}
+
+For instance, the pair 1->1 above would be ProtoBuffer-encoded as the two bytes 00000001|00000001. A pair 1->200 would be the three bytes 00000001|10000001|01001000. (That's because 200 is 11001000 in binary, and if you left-shift the second byte by 7 and OR it with the third byte you get 11001000).
+
+With this strategy, we only store the full strings for each key/value once in the Strings Table. Then we refer to each of these values using its sequence number. For sequence numbers less than 128, this only takes one byte. For numbers 128 through 16384, it only takes two bytes. That's not that many bytes! Furthermore, the memory is in C++ rather than the V8 heap, so instead of being arbitrarily capped at 1.5G, the Object HashSet can take all the memory the computer has available if necessary. It's a pretty sweet data structure, if I do say so myself.
+
+Thanks to my colleagues Mike Demmer, Ludovic Fernandez, and Thilee Subraniam, who contributed to the design and implementation of the Object HashSet.
